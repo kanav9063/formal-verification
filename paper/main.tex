@@ -1,0 +1,540 @@
+% CoProver: Co-Training Proof Generation and Search Heuristics for Automated Theorem Proving
+% Targeting ICLR 2028 / ICML 2027 / NeurIPS 2027
+% Template: ICLR 2028
+
+\documentclass{article}
+
+% ICLR 2028 style (swap for icml2027 or neurips2027 as needed)
+\usepackage{iclr2028_conference}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{subcaption}
+\usepackage{multirow}
+\usepackage{wrapfig}
+
+\newcommand{\coprover}{\textsc{CoProver}}
+\newcommand{\ie}{\textit{i.e.}}
+\newcommand{\eg}{\textit{e.g.}}
+
+\title{CoProver: Co-Training Proof Generation and Search Heuristics\\for Automated Theorem Proving}
+
+\author{
+Kanav Arora \\
+University of California, Santa Barbara \\
+\texttt{kanav@ucsb.edu} \\
+}
+
+\begin{document}
+
+\maketitle
+
+% ============================================================================
+% ABSTRACT
+% ============================================================================
+\begin{abstract}
+Neural theorem provers have achieved remarkable progress on formal mathematics, with recent systems reaching near-saturation on standard benchmarks like MiniF2F. However, existing approaches share a fundamental asymmetry: they invest heavily in training the \emph{tactic generator}---the language model that proposes proof steps---while relying on fixed, hand-designed search strategies to navigate the proof space. We argue that the search heuristic, which determines \emph{which proof states to explore}, is at least as important as the quality of individual tactics. We introduce \coprover{}, a framework that co-trains two components: (1) a tactic generator that proposes proof steps, and (2) a \textbf{proof state value model} that learns to predict which intermediate states are most likely to lead to completed proofs. The value model guides a learned best-first search, focusing computation on promising proof branches. Both models are trained iteratively: better search discovers more proofs, yielding richer training data, which improves both the generator and the value model. On PutnamBench, \coprover{} solves \textbf{[X]} problems at pass@32 compared to [Y] for the strongest baseline, while expanding [Z]\% fewer search nodes on average. On SorryDB, a recently introduced benchmark of real-world incomplete Lean~4 proofs, \coprover{} achieves [X]\% at pass@32 compared to [Y]\% for [baseline]. Ablations confirm that co-training outperforms training either model independently, and that the learned value function provides consistent search efficiency gains across compute budgets. We release all code, trained models, and evaluation infrastructure at \url{https://github.com/kanav9063/coprover}.
+\end{abstract}
+
+% ============================================================================
+% 1. INTRODUCTION
+% ============================================================================
+\section{Introduction}
+\label{sec:intro}
+
+The past three years have witnessed a transformation in automated theorem proving. Beginning with GPT-f's demonstration that language models can generate valid formal proofs~\citep{polu2020generative}, the field has progressed rapidly through LeanDojo's open-source infrastructure~\citep{yang2023leandojo}, DeepSeek-Prover's introduction of reinforcement learning from proof assistant feedback~\citep{xin2024deepseekprover15}, and culminating in AlphaProof's IMO silver medal~\citep{alphaproof2025} and Goedel-Prover-V2's 90.4\% on MiniF2F~\citep{lin2025goedelv2}. These systems share a common architecture: a language model generates candidate proof tactics, a formal verification kernel (typically Lean~4) provides correctness feedback, and iterative training---via supervised fine-tuning, expert iteration, or reinforcement learning---progressively improves the generator.
+
+This paradigm has been enormously successful. Yet it harbors a fundamental asymmetry that has received surprisingly little attention. While the \emph{tactic generator} has been the subject of intense optimization---through larger models~\citep{wang2025kimina}, better training data~\citep{lin2025goedelv2}, reinforcement learning~\citep{xin2024deepseekprover15, ren2025deepseekv2}, and chain-of-thought reasoning~\citep{lin2024leanstar}---the \emph{search strategy} that determines which proof states to explore has remained largely fixed. DeepSeek-Prover-V2 uses a fixed tree search. BFS-Prover uses a fixed best-first search prioritized by cumulative log-probability~\citep{xin2025bfsprover}. Kimina-Prover uses fixed beam search~\citep{wang2025kimina}. In every case, the search heuristic is hand-designed and does not improve with training.
+
+This is analogous to training an increasingly powerful chess move generator while always using a depth-two minimax search. The game-playing AI community recognized this limitation over a decade ago: AlphaGo's breakthrough came not just from a better move predictor (the policy network), but from a \emph{learned position evaluator} (the value network) that made Monte Carlo tree search exponentially more efficient~\citep{silver2016mastering, silver2017alphazero}. The value network answers: ``How promising is this position?'' --- enabling the search to focus on the most fertile branches of the game tree. Neural theorem proving has adopted the policy network (tactic generators) but, to our knowledge, no published system has co-trained a learned value function for proof search alongside the generator.
+
+We introduce \coprover{}, a framework that addresses this gap. \coprover{} co-trains two models:
+\begin{enumerate}
+    \item A \textbf{tactic generator} $G_\theta$ that, given a proof state, produces candidate proof tactics.
+    \item A \textbf{proof state value model} $V_\phi$ that, given a proof state, estimates the probability that the state lies on a path to a completed proof.
+\end{enumerate}
+
+The value model guides a \emph{learned best-first search}: at each step, the state with the highest estimated value is expanded first. Both models are trained iteratively through a co-training loop: the generator proposes tactics, the value model guides search, Lean~4 verifies the results, and both models are updated on the resulting trajectories. Critically, the value model is retrained each round to track the generator's evolving behavior---a stale value model trained on an older generator's trajectories provides poor guidance for the current generator's proof states.
+
+Our contributions are:
+\begin{enumerate}
+    \item \textbf{Learned proof state value model.} We introduce a lightweight model that scores intermediate proof states by their estimated provability, and integrate it into a best-first search procedure (Algorithm~\ref{alg:search}).
+    \item \textbf{Co-training framework.} We propose an iterative training pipeline (Algorithm~\ref{alg:cotrain}) where the tactic generator and value model improve in tandem, with the value model explicitly updated to track the generator's shifting state distribution.
+    \item \textbf{Search efficiency gains.} We demonstrate that \coprover{} achieves comparable or superior performance to strong baselines while expanding significantly fewer search nodes---\ie{}, the learned value function reduces wasted computation on dead-end proof branches.
+    \item \textbf{Empirical results.} \coprover{} achieves [state-of-the-art / competitive] results on PutnamBench~\citep{tsoukalas2024putnambench} and SorryDB~\citep{letson2026sorrydb}, two benchmarks with substantial remaining headroom, while maintaining strong performance on the near-saturated MiniF2F~\citep{zheng2022minif2f}.
+\end{enumerate}
+
+% ============================================================================
+% 2. RELATED WORK
+% ============================================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Neural theorem proving.}
+The application of language models to formal theorem proving was pioneered by GPT-f~\citep{polu2020generative}, which demonstrated that a transformer trained on Metamath proofs could generate novel, valid proofs. Subsequent work shifted to Lean~4 as the dominant proof assistant, driven by its active community and the extensive mathlib library of over 200,000 formalized theorems. LeanDojo~\citep{yang2023leandojo} provided critical open-source infrastructure for extracting training data and interacting with Lean programmatically, enabling ReProver~\citep{yang2023leandojo}, a retrieval-augmented tactic generator that remains a standard baseline. DeepSeek-Prover-V1.5~\citep{xin2024deepseekprover15} introduced reinforcement learning from proof assistant feedback (RLPAF), using Lean's binary pass/fail signal as reward, achieving significant gains over supervised methods. DeepSeek-Prover-V2~\citep{ren2025deepseekv2} further introduced recursive subgoal decomposition, breaking hard theorems into lemmas proved independently, reaching 88.9\% on MiniF2F at the time of its release. BFS-Prover~\citep{xin2025bfsprover} demonstrated that expert iteration with best-first tree search achieves competitive results with a simpler architecture. Kimina-Prover~\citep{wang2025kimina} showed the first clear scaling laws for neural theorem proving, with performance improving consistently as model size increases from 7B to 72B parameters. Goedel-Prover-V2~\citep{lin2025goedelv2} achieved 90.4\% on MiniF2F through scaffolded synthetic data generation and iterative self-correction. Aristotle~\citep{achim2025aristotle} reached IMO gold-medal-equivalent performance by integrating formal Lean proofs with informal mathematical reasoning.
+
+On the agentic side, COPRA~\citep{thakur2024copra} applied in-context learning with GPT-4 to theorem proving without fine-tuning, AutoVerus~\citep{yang2025autoverus} used multi-agent architectures for Rust program verification, and a recent minimal agent~\citep{requena2026minimal} demonstrated competitive performance with a simple iterative refinement architecture. Lean-STaR~\citep{lin2024leanstar} interleaved natural language chain-of-thought reasoning between formal tactic steps, improving proof success rates.
+
+\textbf{In all of these systems, the tactic generator is trained while the search strategy remains fixed.} Our work addresses this gap by jointly training a search heuristic alongside the generator.
+
+\paragraph{Search strategies in theorem proving.}
+The dominant search strategies in neural theorem proving are beam search, best-first search, and Monte Carlo tree search (MCTS). ReProver and BFS-Prover use best-first search where the priority of a proof state is the cumulative log-probability of the tactics on its path from the root---a proxy for value based on the generator's confidence, not a direct estimate of state quality. AlphaProof~\citep{alphaproof2025} reportedly uses MCTS, though the details of its value estimation remain unpublished. Notably, BFS-Prover~\citep{xin2025bfsprover} showed that simple best-first search with expert iteration can match or exceed MCTS-based approaches, suggesting that the search strategy's quality matters less than commonly assumed---\emph{or} that all existing strategies are comparably suboptimal and a learned heuristic could improve upon all of them. Our work tests the latter hypothesis.
+
+\paragraph{Co-training and adversarial training for theorem proving.}
+GAR~\citep{wang2025gar} is the closest related work, proposing a generative adversarial reinforcement learning framework that co-trains a problem \emph{composer} alongside the solver. The composer generates increasingly difficult theorem statements, creating an implicit curriculum. However, GAR co-trains the \emph{problem distribution}, not the \emph{search heuristic}---the search strategy in GAR remains fixed. Our approach is orthogonal: we keep the problem distribution fixed and instead co-train the search heuristic. The two approaches could potentially be combined.
+
+Expert iteration~\citep{anthony2017thinking}, used in BFS-Prover and AlphaZero, iteratively improves a policy by solving problems, collecting solutions, and retraining. Our co-training loop extends expert iteration by additionally updating a value model each round.
+
+\paragraph{Learned value functions in search.}
+The paradigm of jointly training a policy and value function for search was established by AlphaGo~\citep{silver2016mastering} and generalized by AlphaZero~\citep{silver2017alphazero} and MuZero~\citep{schrittwieser2020mastering}. In these systems, the value network estimates the expected outcome from a given position, enabling MCTS to focus on the most promising branches. This paradigm has been applied to various combinatorial optimization problems~\citep{bengio2021machine} but, to our knowledge, has not been cleanly implemented and evaluated for formal theorem proving with co-training. Our work brings the AlphaZero insight---that learning \emph{what to search} is as important as learning \emph{what to play}---to the domain of mathematical proof.
+
+% ============================================================================
+% 3. METHOD
+% ============================================================================
+\section{Method}
+\label{sec:method}
+
+\subsection{Preliminaries: Tactic-Level Theorem Proving}
+\label{sec:preliminaries}
+
+A theorem in Lean~4 defines an initial \emph{proof state} $s_0$ consisting of one or more \emph{goals}---logical propositions that must be proved---along with a set of available \emph{hypotheses}. A \emph{tactic} $\tau$ is a proof step that transforms a proof state $s$ into a new proof state $s'$, potentially reducing the number of remaining goals, introducing subgoals, or applying lemmas from the library. A proof is \emph{complete} when all goals have been discharged (we denote this terminal state as $s_\text{QED}$). The Lean~4 kernel verifies each tactic application, providing either a new valid proof state or an error message.
+
+Proof search can be formalized as a tree $\mathcal{T}$ rooted at $s_0$. Each node is a proof state; each edge corresponds to a tactic application. A path from $s_0$ to $s_\text{QED}$ constitutes a valid proof. The search problem is to find such a path within a computational budget of $N$ node expansions.
+
+\subsection{Proof State Value Model}
+\label{sec:value_model}
+
+We introduce a \emph{proof state value model} $V_\phi: \mathcal{S} \rightarrow [0, 1]$, parameterized by $\phi$, that estimates the probability of reaching $s_\text{QED}$ from a given proof state $s$:
+\begin{equation}
+    V_\phi(s) \approx \Pr[\exists \text{ path from } s \text{ to } s_\text{QED} \mid G_\theta, N]
+\end{equation}
+where $G_\theta$ is the current tactic generator and $N$ is the search budget. Intuitively, $V_\phi(s)$ answers: ``If we continue searching from state $s$ using generator $G_\theta$ with budget $N$, how likely are we to complete the proof?''
+
+\paragraph{Architecture.} We represent each proof state $s$ as its textual representation in Lean~4's tactic mode (the goal display shown to users), which includes remaining goals, local hypotheses, and their types. We encode this text using [a dedicated transformer encoder / the generator's backbone with a separate value head / a frozen sentence encoder], producing a fixed-dimensional representation $\mathbf{h}_s \in \mathbb{R}^d$. A two-layer MLP with ReLU activation maps $\mathbf{h}_s$ to a scalar value:
+\begin{equation}
+    V_\phi(s) = \sigma(\text{MLP}_\phi(\mathbf{h}_s))
+\end{equation}
+where $\sigma$ is the sigmoid function. We ablate architecture choices in Section~\ref{sec:ablations}.
+
+\paragraph{Training.}
+We train $V_\phi$ on proof state trajectories collected during search. For a successful proof trajectory $(s_0, \tau_0, s_1, \tau_1, \ldots, s_T = s_\text{QED})$, we assign labels:
+\begin{equation}
+    y_t = \gamma^{T - t}, \quad t = 0, 1, \ldots, T
+\end{equation}
+where $\gamma \in (0, 1]$ is a discount factor. States closer to $s_\text{QED}$ receive higher labels, providing the value model with a signal about \emph{distance} to completion, not merely reachability. For states on failed trajectories (those that did not reach $s_\text{QED}$ within the search budget), we assign $y = 0$. We optimize with binary cross-entropy loss:
+\begin{equation}
+    \mathcal{L}_V = -\sum_{(s, y)} \left[ y \log V_\phi(s) + (1 - y) \log(1 - V_\phi(s)) \right]
+\end{equation}
+
+\subsection{Learned Best-First Search}
+\label{sec:search}
+
+We integrate the value model into a best-first search procedure, described in Algorithm~\ref{alg:search}. The key departure from standard best-first search (as used in ReProver and BFS-Prover) is the priority function: whereas prior work uses the cumulative log-probability of tactics on the path from the root, $\sum_{i=0}^{t} \log G_\theta(\tau_i \mid s_i)$, we use the value model's estimate $V_\phi(s)$ directly. This is a fundamentally different signal: cumulative log-probability measures the generator's \emph{confidence in the tactics chosen so far}, while $V_\phi(s)$ estimates the \emph{remaining provability of the current state}. A state may be reached via low-probability tactics yet be highly provable (the right idea, expressed unusually), or via high-probability tactics yet be a dead end (a plausible-sounding wrong approach). The value model captures this distinction.
+
+\begin{algorithm}[t]
+\caption{Learned Best-First Search}
+\label{alg:search}
+\begin{algorithmic}[1]
+\REQUIRE Initial proof state $s_0$, generator $G_\theta$, value model $V_\phi$, tactic budget $K$, node budget $N$
+\ENSURE Proof trajectory or FAIL
+\STATE $\mathcal{Q} \leftarrow \{(V_\phi(s_0),\; s_0,\; [])\}$ \COMMENT{Priority queue: (value, state, trajectory)}
+\FOR{$i = 1$ \TO $N$}
+    \STATE $(v,\; s,\; \pi) \leftarrow \mathcal{Q}.\text{pop\_max}()$ \COMMENT{Expand highest-value state}
+    \STATE $\{\tau_1, \ldots, \tau_K\} \leftarrow G_\theta(s)$ \COMMENT{Generate $K$ candidate tactics}
+    \FOR{$j = 1$ \TO $K$}
+        \STATE $s' \leftarrow \textsc{Lean.apply}(s, \tau_j)$
+        \IF{$s' = s_\text{QED}$}
+            \RETURN $\pi \cup \{(s, \tau_j)\}$ \COMMENT{Proof found}
+        \ELSIF{$s' \neq \text{ERROR}$}
+            \STATE $\mathcal{Q}.\text{push}(V_\phi(s'),\; s',\; \pi \cup \{(s, \tau_j)\})$
+        \ENDIF
+    \ENDFOR
+\ENDFOR
+\RETURN FAIL
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Co-Training Loop}
+\label{sec:cotraining}
+
+The tactic generator and value model are trained jointly through an iterative co-training procedure, described in Algorithm~\ref{alg:cotrain}. Each round consists of three phases:
+
+\textbf{Search phase.} The current generator $G_\theta^{(r)}$ and value model $V_\phi^{(r)}$ are used to attempt proofs on a set of theorems $\mathcal{T}$, producing a set of trajectories (both successful and failed).
+
+\textbf{Generator update.} The generator is fine-tuned on successful proof trajectories using either supervised fine-tuning (SFT) on the (state, tactic) pairs from completed proofs, or Group Relative Policy Optimization (GRPO;~\citealt{shao2024deepseekmath}) with binary reward ($+1$ for completed proofs, $0$ otherwise). We additionally experiment with \emph{value-shaped rewards}, where the value model provides dense intermediate reward signals (Section~\ref{sec:generator_training}).
+
+\textbf{Value model update.} The value model is retrained on the full trajectory dataset accumulated across all rounds. Crucially, this includes trajectories from the \emph{current} generator---not just historical data. This is necessary because the generator's policy shift between rounds changes the distribution of proof states encountered during search. A value model trained only on round-$(r{-}1)$ trajectories may assign inaccurate values to the novel states visited by the round-$r$ generator.
+
+\begin{algorithm}[t]
+\caption{Co-Training Loop}
+\label{alg:cotrain}
+\begin{algorithmic}[1]
+\REQUIRE Theorem set $\mathcal{T}$, initial generator $G_\theta^{(0)}$, initial value model $V_\phi^{(0)}$, rounds $R$
+\ENSURE Trained $G_\theta^{(R)}$, $V_\phi^{(R)}$
+\STATE $\mathcal{D} \leftarrow \emptyset$ \COMMENT{Accumulated trajectory dataset}
+\FOR{$r = 1$ \TO $R$}
+    \STATE \COMMENT{\textbf{Search phase}}
+    \STATE $\mathcal{D}^{(r)} \leftarrow \textsc{SearchAll}(\mathcal{T},\; G_\theta^{(r-1)},\; V_\phi^{(r-1)})$
+    \STATE $\mathcal{D} \leftarrow \mathcal{D} \cup \mathcal{D}^{(r)}$
+    \STATE
+    \STATE \COMMENT{\textbf{Generator update}}
+    \STATE $\mathcal{D}^+ \leftarrow \{(s, \tau) \in \mathcal{D}^{(r)} \mid \text{trajectory reaches } s_\text{QED}\}$
+    \STATE $G_\theta^{(r)} \leftarrow \textsc{UpdateGenerator}(G_\theta^{(r-1)},\; \mathcal{D}^+)$ \COMMENT{SFT or GRPO}
+    \STATE
+    \STATE \COMMENT{\textbf{Value model update}}
+    \STATE Label all states in $\mathcal{D}$: $y_s = \gamma^{d(s)}$ if on successful path, $y_s = 0$ otherwise
+    \STATE $V_\phi^{(r)} \leftarrow \textsc{TrainValueModel}(\mathcal{D})$
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+The co-training loop embodies a virtuous cycle: a better value model guides search to more successful proofs, which provides richer training data for the generator; a better generator explores a more productive region of the proof space, which provides more informative training data for the value model.
+
+\subsection{Generator Training Variants}
+\label{sec:generator_training}
+
+We experiment with three approaches for updating the generator:
+
+\textbf{SFT expert iteration.} Following BFS-Prover~\citep{xin2025bfsprover}, we fine-tune the generator on (proof state, tactic) pairs from successful trajectories using standard cross-entropy loss. This is the simplest approach and serves as our default.
+
+\textbf{GRPO.} We apply Group Relative Policy Optimization~\citep{shao2024deepseekmath}, sampling $K$ proof attempts per theorem and assigning reward $r = 1$ for completed proofs and $r = 0$ otherwise. GRPO normalizes rewards within each group, providing a learning signal even when most attempts fail.
+
+\textbf{GRPO with value-shaped rewards.} Instead of the sparse binary reward, we use the value model to provide dense intermediate feedback:
+\begin{equation}
+    r_t = V_\phi(s_{t+1}) - V_\phi(s_t)
+\end{equation}
+This reward signal is positive when a tactic moves the proof state to a higher-value state (progress) and negative when it moves to a lower-value state (regression). This extends the RLPAF paradigm of DeepSeek-Prover-V1.5~\citep{xin2024deepseekprover15}---which uses Lean's binary pass/fail as reward---with a \emph{learned}, continuous-valued reward signal that provides feedback at every proof step, not just at completion.
+
+% ============================================================================
+% 4. EXPERIMENTAL SETUP
+% ============================================================================
+\section{Experimental Setup}
+\label{sec:setup}
+
+\subsection{Benchmarks}
+
+We evaluate on four benchmarks spanning competition mathematics and real-world formalization:
+
+\textbf{PutnamBench}~\citep{tsoukalas2024putnambench} contains 658 problems from the William Lowell Putnam Mathematical Competition, formalized in Lean~4. At the time of writing, the state-of-the-art is 86 problems solved by Goedel-Prover-V2-32B at pass@184~\citep{lin2025goedelv2}, leaving substantial headroom. We use PutnamBench as our primary hard-math benchmark.
+
+\textbf{SorryDB}~\citep{letson2026sorrydb} is a dynamically-updating benchmark of incomplete Lean~4 theorems drawn from 78 real-world formalization projects on GitHub. Unlike competition-focused benchmarks, SorryDB tests a prover's ability to contribute to \emph{practical} formalization efforts. We use a snapshot of 1,000 tasks and evaluate at pass@32.
+
+\textbf{MiniF2F}~\citep{zheng2022minif2f} contains 244 test problems drawn from AMC, AIME, and IMO competitions, formalized in Lean~4. While near-saturated (90.4\% by Goedel-Prover-V2), we report MiniF2F results for comparability with prior work.
+
+\textbf{ProofNet}~\citep{azerbayev2023proofnet} contains 186 undergraduate-level mathematics problems. We use it as a secondary benchmark.
+
+\subsection{Baselines}
+
+We compare against the following systems:
+
+\begin{itemize}
+    \item \textbf{ReProver}~\citep{yang2023leandojo}: Retrieval-augmented tactic generation with fixed best-first search. The standard open-source baseline.
+    \item \textbf{BFS-Prover}~\citep{xin2025bfsprover}: Expert iteration with fixed best-first search, using cumulative log-probability as priority.
+    \item \textbf{DeepSeek-Prover-V2-7B}~\citep{ren2025deepseekv2}: GRPO-trained generator with fixed tree search.
+    \item \textbf{Goedel-Prover-V2-7B}~\citep{lin2025goedelv2}: Scaffolded SFT with self-correction, using fixed best-of-$N$ search.
+    \item \textbf{\coprover{} (generator only)}: Our generator trained via the co-training loop, but evaluated with fixed best-first search (no value model). Isolates the generator's contribution.
+    \item \textbf{\coprover{} (value only)}: The ReProver generator paired with our learned value model. Isolates the value model's contribution.
+\end{itemize}
+
+\subsection{Implementation Details}
+
+\paragraph{Base models.} We initialize the tactic generator from [DeepSeek-Prover-V2-7B / Goedel-Prover-V2-7B] and fine-tune using LoRA~\citep{hu2022lora} with rank 16, $\alpha = 32$, applied to all attention layers. The value model is a [2-layer MLP / 125M transformer] trained from scratch on proof state embeddings.
+
+\paragraph{Training data.} We extract [X] proof state trajectories from mathlib4 using LeanDojo~\citep{yang2023leandojo}, comprising [X] unique proof states across [X] theorems. Each trajectory records the full sequence of (proof state, tactic, resulting state) triples.
+
+\paragraph{Co-training.} We run $R = [X]$ rounds of co-training. In each round, we attempt proofs on [X] theorems with a search budget of $N = 512$ node expansions and $K = 32$ candidate tactics per expansion. Generator fine-tuning uses learning rate [X], batch size [X], for [X] epochs per round. The value model is retrained from scratch each round on the full accumulated dataset with learning rate [X], batch size [X], for [X] epochs.
+
+\paragraph{Evaluation.} We report pass@$K$ for $K \in \{1, 8, 32\}$, computed by sampling $K$ independent proof search attempts per theorem. Following standard practice, each attempt uses a search budget of $N = 512$ node expansions. We additionally report search efficiency metrics: the average number of nodes expanded to find a proof (among successfully proved theorems) and the solve rate as a function of search budget.
+
+\paragraph{Infrastructure.} All experiments use LeanDojo for Lean~4 interaction. Training is performed on [X] NVIDIA A100 80GB GPUs. Total compute: approximately [X] GPU-hours.
+
+% ============================================================================
+% 5. RESULTS
+% ============================================================================
+\section{Results}
+\label{sec:results}
+
+\subsection{Main Results}
+
+Table~\ref{tab:main} presents our main results across all benchmarks.
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Main results.} Pass rates (\%) on MiniF2F-test and ProofNet-test at pass@32, and problems solved on PutnamBench and SorryDB at pass@32. Best results in \textbf{bold}. $^\dagger$Results from original papers where available; others reproduced by us.}
+\label{tab:main}
+\vspace{0.5em}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{MiniF2F} & \textbf{ProofNet} & \textbf{PutnamBench} & \textbf{SorryDB} \\
+ & (pass@32, \%) & (pass@32, \%) & (solved/658) & (pass@32, \%) \\
+\midrule
+ReProver$^\dagger$ & [X] & [X] & [X] & [X] \\
+BFS-Prover$^\dagger$ & [X] & [X] & [X] & [X] \\
+DeepSeek-Prover-V2-7B$^\dagger$ & [X] & [X] & [X] & [X] \\
+Goedel-Prover-V2-7B$^\dagger$ & [X] & [X] & [X] & [X] \\
+\midrule
+\coprover{} (generator only) & [X] & [X] & [X] & [X] \\
+\coprover{} (value only) & [X] & [X] & [X] & [X] \\
+\textbf{\coprover{} (full)} & \textbf{[X]} & \textbf{[X]} & \textbf{[X]} & \textbf{[X]} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\coprover{} (full) achieves the strongest results across [all / X of 4] benchmarks at the 7B parameter scale. On PutnamBench, our primary hard-math benchmark, \coprover{} solves [X] problems compared to [Y] for the strongest baseline ([name]), an improvement of [Z]\%. On SorryDB, \coprover{} achieves [X]\% compared to [Y]\%, demonstrating that the gains transfer to practical formalization tasks. On the near-saturated MiniF2F, \coprover{} achieves [X]\%, [matching / slightly improving upon] prior 7B-scale results.
+
+Notably, the self-ablations reveal that both components contribute: \coprover{} (generator only) improves over external baselines by [X]\%, confirming that the co-training loop produces a better generator even without the value model at test time. \coprover{} (value only) improves over ReProver by [X]\% using the same generator, confirming that the learned search heuristic provides independent gains. The full system exceeds both ablated versions, indicating that the generator and value model are complementary.
+
+\subsection{Search Efficiency}
+\label{sec:efficiency}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/efficiency.pdf}
+\caption{\textbf{Search efficiency.} Solve rate on PutnamBench as a function of search budget (number of nodes expanded). \coprover{} at $N{=}128$ matches BFS-Prover at $N{=}512$, demonstrating approximately [4]$\times$ search efficiency. Shaded regions indicate 95\% confidence intervals.}
+\label{fig:efficiency}
+\end{figure}
+
+Figure~\ref{fig:efficiency} plots the solve rate as a function of the number of nodes expanded during search. \coprover{} consistently outperforms all baselines at every budget level, with the gap widening at smaller budgets. Critically, \coprover{} at $N = 128$ achieves a solve rate comparable to BFS-Prover at $N = 512$---approximately [4]$\times$ more efficient in terms of search nodes. Since each node expansion requires a Lean kernel call and LLM inference, this translates directly to a [4]$\times$ reduction in wall-clock proving time.
+
+Among successfully proved theorems, \coprover{} expands an average of [X] nodes compared to [Y] for BFS-Prover and [Z] for ReProver---a [W]\% reduction. The efficiency gains are most pronounced on harder problems (those requiring $>$10 proof steps), where the value model's guidance has more opportunities to prune unproductive branches.
+
+\subsection{Co-Training Dynamics}
+\label{sec:dynamics}
+
+\begin{figure}[t]
+\centering
+\begin{subfigure}[t]{0.48\textwidth}
+    \includegraphics[width=\textwidth]{figures/cotraining_solve.pdf}
+    \caption{Cumulative theorems solved per round.}
+    \label{fig:cotrain_solve}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.48\textwidth}
+    \includegraphics[width=\textwidth]{figures/cotraining_value.pdf}
+    \caption{Value model accuracy per round.}
+    \label{fig:cotrain_value}
+\end{subfigure}
+\caption{\textbf{Co-training dynamics.} (a) Both co-trained models (solid) and independently trained models (dashed) improve over rounds, but co-training yields a growing advantage. (b) The value model's accuracy on held-out proof states improves each round, indicating that it learns increasingly reliable state evaluations.}
+\label{fig:cotraining}
+\end{figure}
+
+Figure~\ref{fig:cotraining} tracks model performance across co-training rounds. Several observations emerge:
+
+\textbf{Both models improve.} The number of theorems solved increases monotonically with co-training rounds (Figure~\ref{fig:cotrain_solve}), and the value model's accuracy on held-out states improves correspondingly (Figure~\ref{fig:cotrain_value}).
+
+\textbf{Co-training outperforms independent training.} When the generator and value model are trained independently (generator via expert iteration without the value model, value model on fixed trajectories without generator updates), performance plateaus earlier. Co-training provides an additional [X]\% improvement by round [R], with the gap widening over rounds.
+
+\textbf{Diminishing returns.} Gains per round decrease after round [X], suggesting convergence of the co-training loop. We observe [X] rounds to be sufficient for near-optimal performance.
+
+\subsection{Ablation Studies}
+\label{sec:ablations}
+
+Table~\ref{tab:ablations} presents ablation studies isolating the contribution of each design choice.
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Ablation studies} on MiniF2F-test (pass@32). Each row modifies one component of the full \coprover{} system.}
+\label{tab:ablations}
+\vspace{0.5em}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Configuration} & \textbf{pass@32 (\%)} & \textbf{$\Delta$ vs.\ full} \\
+\midrule
+\coprover{} (full) & [X] & --- \\
+\midrule
+\multicolumn{3}{l}{\textit{Co-training}} \\
+\quad No co-training (independent) & [X] & $-$[X]\% \\
+\quad Generator only (no value model) & [X] & $-$[X]\% \\
+\quad Value only (no generator training) & [X] & $-$[X]\% \\
+\midrule
+\multicolumn{3}{l}{\textit{Value model}} \\
+\quad Binary labels (0/1) vs.\ discounted & [X] & $-$[X]\% \\
+\quad MLP on frozen embeddings & [X] & $-$[X]\% \\
+\quad Transformer encoder (125M) & [X] & [+/--][X]\% \\
+\quad Cumulative log-prob priority (BFS) & [X] & $-$[X]\% \\
+\midrule
+\multicolumn{3}{l}{\textit{Generator training}} \\
+\quad SFT only (no RL) & [X] & $-$[X]\% \\
+\quad GRPO (binary reward) & [X] & [+/--][X]\% \\
+\quad GRPO + value-shaped reward & [X] & $+$[X]\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Co-training is essential.} Removing co-training (training generator and value model independently) reduces performance by [X]\%, confirming that the models must adapt to each other.
+
+\textbf{The value model matters.} Removing the value model and using fixed BFS reduces performance by [X]\%, demonstrating that learned search heuristics provide substantial gains beyond what generator improvement alone achieves.
+
+\textbf{Discounted labels outperform binary.} Using soft labels $y_t = \gamma^{T-t}$ instead of binary 0/1 improves performance by [X]\%, suggesting that distance-to-completion information is valuable for the value model.
+
+\textbf{Value-shaped rewards help.} Using the value model to provide dense intermediate rewards for GRPO (Section~\ref{sec:generator_training}) yields an additional [X]\% gain over binary GRPO, and [X]\% over SFT expert iteration. This confirms that the value model is useful not only for guiding search but also for shaping the generator's training signal.
+
+% ============================================================================
+% 6. ANALYSIS
+% ============================================================================
+\section{Analysis}
+\label{sec:analysis}
+
+\subsection{What Does the Value Model Learn?}
+
+To understand what the value model captures, we analyze the correlation between proof state features and predicted values across [X] held-out proof states.
+
+\textbf{Number of remaining goals.} Value decreases monotonically with the number of remaining goals ($\rho = -[X]$), consistent with the intuition that fewer goals indicate proximity to completion.
+
+\textbf{Goal complexity.} States with shorter goal terms (measured by token count) receive higher values ($\rho = -[X]$), reflecting that simpler goals are easier to discharge.
+
+\textbf{Tactic history.} States reached via \texttt{simp}, \texttt{ring}, or \texttt{norm\_num}---powerful automation tactics---receive higher values on average ([X] vs.\ [X] for states reached via manual tactics), suggesting the value model learns that automation-friendly states are more likely to be provable.
+
+\textbf{[Surprise finding].} [Describe an unexpected pattern in what the value model learned---\eg, a structural feature of proof states that correlates with value in a non-obvious way.]
+
+\subsection{Qualitative Examples}
+
+We present three illustrative examples where \coprover{}'s learned search makes qualitatively different decisions than fixed BFS.
+
+\textbf{Example 1: Correct prioritization.} On PutnamBench problem [ID], the proof requires an unusual algebraic manipulation at step 3. BFS-Prover assigns this branch low priority (the tactic has low log-probability) and explores it only after exhausting 400+ nodes on more ``natural'' but ultimately dead-end branches. \coprover{}'s value model assigns the resulting state a score of [X] (top 5\% of candidates), recognizing that the simplified goal is close to a known form. \coprover{} finds the proof in [X] nodes; BFS-Prover requires [Y].
+
+\textbf{Example 2: Efficient path selection.} On SorryDB task [ID], both \coprover{} and BFS-Prover find valid proofs, but \coprover{}'s proof uses [X] steps (expanding [Y] nodes) while BFS-Prover's uses [X'] steps (expanding [Y'] nodes). The value model identifies a shorter path through a library lemma that BFS overlooks due to the tactic's low prior probability.
+
+\textbf{Example 3: Failure case.} On MiniF2F problem [ID], the value model assigns high scores to a state that requires an inductive argument, but the induction hypothesis is insufficiently general. The value model is ``tricked'' by the superficial simplicity of the remaining goal, not recognizing that the induction is flawed. This suggests that the value model primarily captures syntactic features of proof states and has limited understanding of deeper logical structure.
+
+\subsection{When Does the Value Model Help Most?}
+
+We stratify the improvement from the value model by problem difficulty (measured by minimum proof length among all methods):
+
+\begin{itemize}
+    \item \textbf{Easy problems} (1--3 steps): $+$[X]\% relative improvement. Minimal benefit---the search space is small enough that any strategy succeeds.
+    \item \textbf{Medium problems} (4--10 steps): $+$[X]\% relative improvement. Moderate benefit from pruning dead-end branches.
+    \item \textbf{Hard problems} ($>$10 steps): $+$[X]\% relative improvement. Largest gains, as the combinatorial explosion of the search tree makes intelligent pruning essential.
+\end{itemize}
+
+This confirms that learned search heuristics provide the greatest benefit precisely where they are most needed: on hard problems with large search spaces.
+
+% ============================================================================
+% 7. DISCUSSION
+% ============================================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Limitations.}
+The value model introduces additional inference overhead at each node expansion. While this is more than offset by the reduction in total nodes expanded (Section~\ref{sec:efficiency}), it adds architectural complexity. The co-training loop requires multiple training rounds, increasing total compute relative to single-round approaches; however, the per-round cost is modest due to LoRA fine-tuning. The value model's effectiveness depends on the availability of sufficient successful trajectories---on extremely hard theorems where the initial generator finds very few proofs, the value model receives limited positive training signal. Finally, our current value model operates on proof states as text; richer representations incorporating the proof tree structure or type-theoretic information could potentially improve accuracy.
+
+\paragraph{Broader impact.}
+Improving the efficiency of automated theorem proving has direct applications in mathematics formalization and software/hardware verification. More efficient proof search reduces the computational cost of formally verifying safety-critical systems. We do not foresee negative societal impacts from this work.
+
+\paragraph{Future work.}
+Several extensions are natural. First, the value model enables full \textbf{AlphaZero-style MCTS} for theorem proving, with learned policy and value functions jointly guiding tree search---we use the simpler best-first search here but MCTS could provide further gains. Second, the value model can identify \textbf{frontier theorems}---those with estimated value near 0.5, indicating they are ``just barely'' out of reach---for optimal curriculum design. Third, our framework is architecture-agnostic and could be combined with orthogonal advances such as \textbf{subgoal decomposition}~\citep{ren2025deepseekv2}, \textbf{retrieval augmentation}~\citep{yang2023leandojo}, or \textbf{self-correction}~\citep{lin2025goedelv2}. Fourth, the learned search paradigm could be applied to \textbf{hardware formal verification}, where search efficiency is even more critical due to the computational cost of model checking. Finally, scaling to larger generators (32B, 70B) and studying the scaling behavior of the value model is a natural next step.
+
+% ============================================================================
+% 8. CONCLUSION
+% ============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented \coprover{}, a framework that co-trains a tactic generator and a proof state value model for automated theorem proving in Lean~4. By learning \emph{what to search}---not just \emph{what tactics to generate}---\coprover{} achieves [state-of-the-art / competitive] performance on PutnamBench and SorryDB while expanding [X]$\times$ fewer search nodes than fixed-strategy baselines. Our ablations confirm that co-training provides gains beyond what either component achieves independently, and that value-shaped rewards further improve generator training. These results suggest that the proof search heuristic is a substantially underexplored axis of improvement in neural theorem proving, and that the AlphaZero paradigm---jointly learning a policy and value function---transfers effectively from game-playing to mathematical reasoning.
+
+% ============================================================================
+% ACKNOWLEDGMENTS
+% ============================================================================
+\section*{Acknowledgments}
+
+[Acknowledge advisors, compute providers, funding sources.]
+
+% ============================================================================
+% REFERENCES
+% ============================================================================
+\bibliography{references}
+\bibliographystyle{iclr2028_conference}
+
+% ============================================================================
+% APPENDIX
+% ============================================================================
+\appendix
+
+\section{Hyperparameters}
+\label{app:hyperparams}
+
+\begin{table}[h]
+\centering
+\caption{Hyperparameters for all experiments.}
+\vspace{0.5em}
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+\multicolumn{2}{l}{\textit{Generator}} \\
+Base model & [DeepSeek-Prover-V2-7B / Goedel-Prover-V2-7B] \\
+LoRA rank & 16 \\
+LoRA $\alpha$ & 32 \\
+Learning rate & [X] \\
+Batch size & [X] \\
+Epochs per round & [X] \\
+\midrule
+\multicolumn{2}{l}{\textit{Value model}} \\
+Architecture & [MLP / Transformer] \\
+Hidden dimensions & [X] \\
+Learning rate & [X] \\
+Batch size & [X] \\
+Epochs per round & [X] \\
+Discount $\gamma$ & [X] \\
+\midrule
+\multicolumn{2}{l}{\textit{Search}} \\
+Tactics per expansion ($K$) & 32 \\
+Node budget ($N$) & 512 \\
+\midrule
+\multicolumn{2}{l}{\textit{Co-training}} \\
+Rounds ($R$) & [X] \\
+Theorems per round & [X] \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Additional Benchmark Results}
+\label{app:additional}
+
+[Full per-problem breakdown tables for all benchmarks.]
+
+\section{Value Model Architecture Comparison}
+\label{app:architecture}
+
+[Detailed comparison of MLP vs.\ transformer value models, including training curves and inference latency.]
+
+\section{Complete Proof Examples}
+\label{app:proofs}
+
+[5--10 full proof transcripts showing \coprover{}'s search trace alongside baselines, with value model scores annotated at each node.]
+
+\section{Compute Budget Breakdown}
+\label{app:compute}
+
+\begin{table}[h]
+\centering
+\caption{Compute budget breakdown.}
+\vspace{0.5em}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Component} & \textbf{GPU-hours} & \textbf{Est.\ cost (USD)} \\
+\midrule
+Data extraction (LeanDojo) & [X] (CPU) & [X] \\
+Generator fine-tuning ($R$ rounds) & [X] & [X] \\
+Value model training ($R$ rounds) & [X] & [X] \\
+Search / evaluation & [X] & [X] \\
+Baseline reproduction & [X] & [X] \\
+\midrule
+\textbf{Total} & \textbf{[X]} & \textbf{[X]} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}
